@@ -1,581 +1,400 @@
+// wp2openapi: Generate an OpenAPI 3.0 spec from a WordPress REST index/namespace
+// - Handles nested named regex groups in routes (balanced parsing)
+// - Tolerant to args/properties/items being {} or []
+// - Keeps endpoint args per method; GET-ish -> query params; write methods -> requestBody
+// - Accepts -u (URL or local JSON path), -o (output), -debug for diagnostics
+
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
-	"regexp"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
 
-/*
-MVP: WordPress REST → OpenAPI 3.0 (JSON)
-- Input: /wp-json/ or /?rest_route=/ (or site root, which we normalize).
-- Output: OpenAPI 3.0 JSON with paths/operations and basic parameters derived from the index.
-*/
-
-type wpIndex struct {
-	Name       string                 `json:"name"`
-	Namespaces []string               `json:"namespaces"`
-	Routes     map[string]wpRouteMeta `json:"routes"`
-}
-
-type wpRouteMeta struct {
-	Namespace string					`json:"namespace"`
-	Methods   []string					`json:"methods"`
-	Endpoints []wpEndpoint				`json:"endpoints"`
-	Args      json.RawMessage			`json:"args"` // can be {}, [] or null
-	// Some installs include "schema" in the root index, but we ignore for MVP.
-}
-
-type wpEndpoint struct {
-	Methods []string               `json:"methods"`
-	Args    json.RawMessage 	`json:"args"` // can be {} or [] or null
-}
-
-type wpArgSchema struct {
-	Required    bool            `json:"required"`
-	Default     any             `json:"default"`
-	Type        json.RawMessage `json:"type"`
-	Enum        []any           `json:"enum"`
-	Items       any             `json:"items"`
-	Format      string          `json:"format"`
-	Description string          `json:"description"`
-}
-
-// Accept args as object OR empty array/null
-func decodeArgs(raw json.RawMessage) map[string]wpArgSchema {
-	if len(raw) == 0 {
-		return map[string]wpArgSchema{}
-	}
-	// Try as object first
-	var obj map[string]wpArgSchema
-	if err := json.Unmarshal(raw, &obj); err == nil && obj != nil {
-		return obj
-	}
-	// If it's an array (often []), treat as empty
-	var arr []any
-	if err := json.Unmarshal(raw, &arr); err == nil {
-		return map[string]wpArgSchema{}
-	}
-	// Any other shape => ignore gracefully
-	return map[string]wpArgSchema{}
-}
-
-// ------ OpenAPI types (minimal subset we need) ------
-
-type openAPI struct {
-	OpenAPI string                 `json:"openapi"`
-	Info    openAPIInfo            `json:"info"`
-	Servers []openAPIServer        `json:"servers,omitempty"`
-	Paths   map[string]openAPIPath `json:"paths"`
-	// You can extend with Components later (securitySchemes, schemas, etc.)
-}
-
-type openAPIInfo struct {
-	Title   string `json:"title"`
-	Version string `json:"version"`
-}
-
-type openAPIServer struct {
-	URL string `json:"url"`
-}
-
-type openAPIPath map[string]openAPIOperation // get/post/put/patch/delete/head/options
-
-type openAPIOperation struct {
-	Summary     string                `json:"summary,omitempty"`
-	Description string                `json:"description,omitempty"`
-	Parameters  []openAPIParameter    `json:"parameters,omitempty"`
-	RequestBody *openAPIRequestBody   `json:"requestBody,omitempty"`
-	Responses   map[string]openAPIRes `json:"responses"`
-	Tags        []string              `json:"tags,omitempty"`
-}
-
-type openAPIParameter struct {
-	Name        string              `json:"name"`
-	In          string              `json:"in"` // "query" or "path"
-	Required    bool                `json:"required"`
-	Description string              `json:"description,omitempty"`
-	Schema      map[string]any      `json:"schema,omitempty"`
-}
-
-type openAPIRequestBody struct {
-	Required bool                           `json:"required"`
-	Content  map[string]openAPIMediaType    `json:"content"`
-}
-
-type openAPIMediaType struct {
-	Schema map[string]any `json:"schema,omitempty"`
-}
-
-type openAPIRes struct {
-	Description string                         `json:"description"`
-	Content     map[string]openAPIMediaType    `json:"content,omitempty"`
-}
-
-// ------ Main ------
-
-// Split endpoint args for a given HTTP method into query params vs JSON body schema.
-// Route-level args should always be query parameters; pass them in via routeArgs.
-// Returns (queryParams, requestBodyPtr).
-func buildParamsAndBody(method string, routeArgs map[string]wpArgSchema, epArgs map[string]wpArgSchema) ([]openAPIParameter, *openAPIRequestBody) {
-	var params []openAPIParameter
-
-	// 1) Route-level args => always query params
-	for name, a := range routeArgs {
-		params = append(params, openAPIParameter{
-			Name:        name,
-			In:          "query",
-			Required:    a.Required,
-			Description: a.Description,
-			Schema:      wpArgToSchema(a),
-		})
-	}
-
-	isBodyMethod := method == "POST" || method == "PUT" || method == "PATCH"
-
-	if !isBodyMethod {
-		// 2a) Non-body verbs: endpoint args also treated as query params
-		for name, a := range epArgs {
-			params = append(params, openAPIParameter{
-				Name:        name,
-				In:          "query",
-				Required:    a.Required,
-				Description: a.Description,
-				Schema:      wpArgToSchema(a),
-			})
-		}
-		return params, nil
-	}
-
-	// 2b) Body verbs: endpoint args -> JSON request body schema
-	props := map[string]any{}
-	required := []string{}
-	for name, a := range epArgs {
-		props[name] = wpArgToSchema(a)
-		if a.Required {
-			required = append(required, name)
-		}
-	}
-
-	bodySchema := map[string]any{"type": "object", "properties": props}
-	if len(required) > 0 {
-		bodySchema["required"] = required
-	}
-
-	body := &openAPIRequestBody{
-		Required: len(required) > 0,
-		Content: map[string]openAPIMediaType{
-			"application/json": {Schema: bodySchema},
-		},
-	}
-	return params, body
-}
-
-func main() {
-	var (
-		inURL   string
-		outFile string
-		title   string
-		version string
-	)
-	flag.StringVar(&inURL, "u", "", "Entry point URL (/wp-json/ or /?rest_route=/) or site root (required)")
-	flag.StringVar(&outFile, "o", "", "Output file for OpenAPI JSON (default: stdout)")
-	flag.StringVar(&title, "title", "", "API title (default: WP site name or host)")
-	flag.StringVar(&version, "version", "1.0.0", "API version string")
-	flag.Parse()
-
-	if inURL == "" {
-		fail("missing -u URL (entry point or site root)")
-	}
-
-	entryURL, baseServerURL, err := normalizeEntryURL(inURL)
-	if err != nil {
-		fail("normalize url: %v", err)
-	}
-
-	idx, rawName, err := fetchWPIndex(entryURL)
-	if err != nil {
-		fail("fetch index: %v", err)
-	}
-
-	apiTitle := title
-	if apiTitle == "" {
-		apiTitle = firstNonEmpty(idx.Name, rawName, mustHost(baseServerURL))
-	}
-
-	oas := buildOpenAPI(idx, apiTitle, version, baseServerURL)
-
-	var out io.Writer = os.Stdout
-	if outFile != "" {
-		f, err := os.Create(outFile)
-		if err != nil {
-			fail("create output: %v", err)
-		}
-		defer f.Close()
-		out = f
-	}
-	enc := json.NewEncoder(out)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(oas); err != nil {
-		fail("encode openapi json: %v", err)
-	}
-}
-
-// ------ Fetch & Normalize ------
-
-// normalizeEntryURL takes either a site root or an entry point and returns:
-// - entryURL: absolute URL to the JSON index
-// - baseServerURL: server URL for OAS (scheme+host [+port] + `/wp-json`)
-func normalizeEntryURL(in string) (entryURL, baseServerURL string, err error) {
-	u, err := url.Parse(in)
-	if err != nil {
-		return "", "", err
-	}
-	if u.Scheme == "" {
-		u.Scheme = "https"
-	}
-	// Detect if caller already gave us an index endpoint
-	lc := strings.ToLower(u.String())
-	if strings.Contains(lc, "rest_route=/") {
-		// Keep as-is; server base should be scheme://host
-		base := &url.URL{Scheme: u.Scheme, Host: u.Host}
-		return u.String(), strings.TrimRight(base.String(), "/"), nil
-	}
-	if strings.HasSuffix(lc, "/wp-json") || strings.HasSuffix(lc, "/wp-json/") {
-		// Standard index
-		base := &url.URL{Scheme: u.Scheme, Host: u.Host}
-		return ensureTrailingSlash(u.String()), strings.TrimRight(base.String(), "/") + "/wp-json", nil
-	}
-	// Otherwise treat as site root; try /wp-json/ first, then /?rest_route=/
-	root := &url.URL{Scheme: u.Scheme, Host: u.Host, Path: "/wp-json/"}
-	if ok, _ := urlReturnsJSON(root.String()); ok {
-		return root.String(), strings.TrimRight((&url.URL{Scheme: u.Scheme, Host: u.Host}).String(), "/") + "/wp-json", nil
-	}
-	alt := &url.URL{Scheme: u.Scheme, Host: u.Host, RawQuery: "rest_route=/"}
-	if ok, _ := urlReturnsJSON(alt.String()); ok {
-		return alt.String(), strings.TrimRight((&url.URL{Scheme: u.Scheme, Host: u.Host}).String(), "/"), nil
-	}
-	return "", "", errors.New("could not locate a REST index at /wp-json/ or /?rest_route=/")
-}
-
-func urlReturnsJSON(u string) (bool, error) {
-	c := &http.Client{Timeout: 12 * time.Second}
-	req, _ := http.NewRequest(http.MethodGet, u, nil)
-	req.Header.Set("Accept", "application/json")
-	res, err := c.Do(req)
-	if err != nil {
-		return false, err
-	}
-	defer res.Body.Close()
-	ct := strings.ToLower(res.Header.Get("Content-Type"))
-	return res.StatusCode < 400 && strings.Contains(ct, "json"), nil
-}
-
-func fetchWPIndex(entry string) (wpIndex, string, error) {
-	var idx wpIndex
-	c := &http.Client{Timeout: 20 * time.Second}
-	req, _ := http.NewRequest(http.MethodGet, entry, nil)
-	req.Header.Set("Accept", "application/json")
-	res, err := c.Do(req)
-	if err != nil {
-		return idx, "", err
-	}
-	defer res.Body.Close()
-	if res.StatusCode >= 400 {
-		return idx, "", fmt.Errorf("status %d", res.StatusCode)
-	}
-	b, _ := io.ReadAll(res.Body)
-	if err := json.Unmarshal(b, &idx); err != nil {
-		// try best-effort to extract "name" if present at top-level
-		var tmp map[string]any
-		if json.Unmarshal(b, &tmp) == nil {
-			if v, ok := tmp["name"].(string); ok {
-				return idx, v, err
-			}
-		}
-		return idx, "", err
-	}
-	return idx, idx.Name, nil
-}
-
-// ------ Build OpenAPI from index ------
-
 var (
-	// Replace WP route regex groups (?P<name>pattern) with {name}
-	reGroup = regexp.MustCompile(`\(\?P<([a-zA-Z0-9_]+)>([^)]+)\)`)
-	// Extract param names from template
-	reParam = regexp.MustCompile(`\{([a-zA-Z0-9_]+)\}`)
+	flagURL   = flag.String("u", "", "WordPress REST URL or local JSON file (e.g. https://site/wp-json or ./wp-json.json)")
+	flagOut   = flag.String("o", "", "Output OpenAPI file (defaults to stdout)")
+	flagDebug = flag.Bool("debug", false, "Print debug stats to stderr")
 )
 
-// buildOpenAPI constructs a minimal, valid OAS 3.0 document.
-func buildOpenAPI(idx wpIndex, title, version, serverBase string) openAPI {
-	paths := map[string]openAPIPath{}
+// ---------------- WordPress discovery (tolerant) ----------------
 
-	// Deterministic order for stable outputs
-	routeKeys := make([]string, 0, len(idx.Routes))
-	for k := range idx.Routes {
-		routeKeys = append(routeKeys, k)
+type WPIndex struct {
+	Name        string              `json:"name"`
+	Description string              `json:"description"`
+	URL         string              `json:"url"`
+	Home        string              `json:"home"`
+	Namespace   string              `json:"namespace"`
+	Namespaces  []string            `json:"namespaces"`
+	Routes      map[string]*WPRoute `json:"routes"`
+}
+
+type WPRoute struct {
+	Namespace string          `json:"namespace"`
+	Methods   []string        `json:"methods"`
+	ArgsRaw   json.RawMessage `json:"args"`         // {} or [] or null
+	Endpoints []WPEndpoint    `json:"endpoints"`
+}
+
+type WPEndpoint struct {
+	Methods []string        `json:"methods"`
+	ArgsRaw json.RawMessage `json:"args"`          // {} or [] or null
+}
+
+// ---------------- Minimal OpenAPI 3 types ----------------
+
+type OA3Spec struct {
+	OpenAPI string                 `json:"openapi"`
+	Info    OAInfo                 `json:"info"`
+	Servers []OAServer             `json:"servers,omitempty"`
+	Paths   map[string]OAPathItem  `json:"paths"`
+}
+
+type OAInfo struct{
+	Title       string `json:"title"`
+	Description string `json:"description,omitempty"`
+	Version     string `json:"version"`
+}
+
+type OAServer struct{ URL string `json:"url"` }
+
+type OAPathItem struct {
+	Get     *OAOperation `json:"get,omitempty"`
+	Post    *OAOperation `json:"post,omitempty"`
+	Put     *OAOperation `json:"put,omitempty"`
+	Patch   *OAOperation `json:"patch,omitempty"`
+	Delete  *OAOperation `json:"delete,omitempty"`
+	Options *OAOperation `json:"options,omitempty"`
+	Head    *OAOperation `json:"head,omitempty"`
+}
+
+type OAOperation struct {
+	OperationID string                 `json:"operationId,omitempty"`
+	Summary     string                 `json:"summary,omitempty"`
+	Tags        []string               `json:"tags,omitempty"`
+	Parameters  []OAParameter          `json:"parameters,omitempty"`
+	RequestBody *OARequestBody         `json:"requestBody,omitempty"`
+	Responses   map[string]OAResponse  `json:"responses"`
+}
+
+type OAParameter struct {
+	Name        string   `json:"name"`
+	In          string   `json:"in"`
+	Required    bool     `json:"required"`
+	Description string   `json:"description,omitempty"`
+	Schema      OASchema `json:"schema"`
+}
+
+type OARequestBody struct {
+	Required bool               `json:"required"`
+	Content  map[string]OAMedia `json:"content"`
+}
+
+type OAMedia struct { Schema OASchema `json:"schema"` }
+
+type OAResponse struct { Description string `json:"description"` }
+
+type OASchema struct {
+	Type        any                 `json:"type,omitempty"`
+	Format      string              `json:"format,omitempty"`
+	Enum        []any               `json:"enum,omitempty"`
+	Items       *OASchema           `json:"items,omitempty"`
+	Properties  map[string]OASchema `json:"properties,omitempty"`
+	Required    []string            `json:"required,omitempty"`
+	Description string              `json:"description,omitempty"`
+	Nullable    bool                `json:"nullable,omitempty"`
+	OneOf       []OASchema          `json:"oneOf,omitempty"`
+	AdditionalProperties any        `json:"additionalProperties,omitempty"`
+}
+
+// ---------------- Utilities ----------------
+
+func isHTTP(u string) bool { return strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") }
+
+func fetch(u string) ([]byte, error) {
+	if isHTTP(u) {
+		c := &http.Client{Timeout: 30 * time.Second}
+		r, err := c.Get(u)
+		if err != nil { return nil, err }
+		defer r.Body.Close()
+		if r.StatusCode < 200 || r.StatusCode >= 300 { return nil, fmt.Errorf("HTTP %d", r.StatusCode) }
+		return io.ReadAll(r.Body)
 	}
-	sort.Strings(routeKeys)
+	return os.ReadFile(u)
+}
 
-	for _, route := range routeKeys {
-		meta := idx.Routes[route]
-
-		// Convert path & collect path param patterns
-		oasPath, paramPatterns := wpRouteToOASPath(route)
-
-		// Gather methods (union of endpoints[].methods, fallback to route-level methods, default GET)
-		methods := set[string]{}
-		for _, ep := range meta.Endpoints {
-			for _, m := range ep.Methods { methods.add(strings.ToUpper(m)) }
+// replaceNamedGroups handles nested parentheses inside a (?P<name> ... ) group
+func replaceNamedGroups(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		if i+3 < len(s) && s[i] == '(' && s[i+1] == '?' && s[i+2] == 'P' && s[i+3] == '<' {
+			j := i+4
+			for j < len(s) && s[j] != '>' { j++ }
+			if j >= len(s) { b.WriteString(s[i:]); break }
+			name := s[i+4:j]
+			j++
+			depth := 1
+			k := j
+			for k < len(s) && depth > 0 {
+				if s[k] == '(' { depth++ } else if s[k] == ')' { depth-- }
+				k++
+			}
+			b.WriteString("{"); b.WriteString(name); b.WriteString("}")
+			i = k
+			continue
 		}
-		if len(methods) == 0 {
-			for _, m := range meta.Methods { methods.add(strings.ToUpper(m)) }
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
+}
+
+func sanitizeRoutePath(route string) (string, []string) {
+	p := strings.ReplaceAll(route, `\/`, "/")
+	p = strings.ReplaceAll(p, `\\`, "")
+	p = replaceNamedGroups(p)
+	// Remove obvious regex tokens and character classes
+	for _, j := range []string{"^", "$", "+", "?", ":", "|"} { p = strings.ReplaceAll(p, j, "") }
+	for {
+		start := strings.Index(p, "[")
+		if start == -1 { break }
+		end := strings.Index(p[start+1:], "]")
+		if end == -1 { break }
+		p = p[:start] + p[start+end+2:]
+	}
+	for strings.Contains(p, "//") { p = strings.ReplaceAll(p, "//", "/") }
+	if !strings.HasPrefix(p, "/") { p = "/" + p }
+	if len(p) > 1 { p = strings.TrimRight(p, "/") }
+	params := []string{}
+	for _, seg := range strings.Split(p, "/") {
+		if strings.HasPrefix(seg, "{") && strings.HasSuffix(seg, "}") {
+			params = append(params, strings.TrimSuffix(strings.TrimPrefix(seg, "{"), "}"))
 		}
-		if len(methods) == 0 { methods.add("GET") }
+	}
+	return p, params
+}
 
-		// Route-level args: usually collection filters/pagination
-		routeArgs := decodeArgs(meta.Args) // instead of looping meta.Args directly
-		//routeArgs := map[string]wpArgSchema{}
-		//for k, v := range meta.Args { routeArgs[k] = v }
+// parse args: accept {} or [] or null
+func parseArgs(raw json.RawMessage) map[string]any {
+	if len(raw) == 0 || string(raw) == "null" { return map[string]any{} }
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err == nil { return obj }
+	var arr []any
+	if err := json.Unmarshal(raw, &arr); err == nil { return map[string]any{} }
+	return map[string]any{}
+}
 
-		// Ensure path exists
-		if _, ok := paths[oasPath]; !ok { paths[oasPath] = openAPIPath{} }
+// choose args by method: endpoint args override; GET-like can fall back to route args
+func chooseArgsForMethod(routeArgs, epArgs map[string]any, method string) map[string]any {
+	if len(epArgs) > 0 { return epArgs }
+	switch strings.ToUpper(method) {
+	case "GET", "HEAD", "DELETE":
+		return routeArgs
+	default:
+		return map[string]any{}
+	}
+}
 
-		// Compute path params from template
-		pathParamSet := map[string]struct{}{}
-		for _, m := range reParam.FindAllStringSubmatch(oasPath, -1) {
-			pathParamSet[m[1]] = struct{}{}
-		}
-
-		for _, m := range methods.sorted() {
-			// Collect endpoint args for *this* method only
-			epArgsForMethod := map[string]wpArgSchema{}
-			for _, ep := range meta.Endpoints {
-				verbMatches := false
-				for _, em := range ep.Methods {
-					if strings.EqualFold(em, m) { verbMatches = true; break }
-				}
-				if !verbMatches { continue }
-				for k, v := range decodeArgs(ep.Args) {
-					epArgsForMethod[k] = v
+// Build OASchema from a generic WP arg map
+func buildSchema(arg map[string]any) OASchema {
+	s := OASchema{}
+	// type can be string or []string (incl. "null")
+	if tv, ok := arg["type"]; ok {
+		switch t := tv.(type) {
+		case string:
+			s.Type = normalizeType(t)
+		case []any:
+			var types []string; nullable := false
+			for _, e := range t {
+				if ss, ok := e.(string); ok {
+					if ss == "null" { nullable = true; continue }
+					types = append(types, normalizeType(ss))
 				}
 			}
-
-			// Build operation shell
-			op := openAPIOperation{
-				Summary:     fmt.Sprintf("%s %s", m, oasPath),
-				Description: fmt.Sprintf("Auto-generated from WordPress REST index for %q.", route),
-				Responses: map[string]openAPIRes{
-					"200": {Description: "OK", Content: map[string]openAPIMediaType{
-						"application/json": {Schema: map[string]any{"type": "object"}},
-					}},
-				},
+			if len(types) == 1 { s.Type = types[0] } else if len(types) > 1 {
+				for _, tt := range types { s.OneOf = append(s.OneOf, OASchema{Type: tt}) }
 			}
-
-			// Path parameters are always required
-			var pathParams []openAPIParameter
-			for pname := range pathParamSet {
-				p := openAPIParameter{
-					Name:     pname,
-					In:       "path",
-					Required: true,
-					Schema:   map[string]any{"type": "string"},
-				}
-				if pat, ok := paramPatterns[pname]; ok && pat != "" {
-					p.Schema["pattern"] = pat
-				}
-				if a, ok := routeArgs[pname]; ok && a.Description != "" {
-					p.Description = a.Description
-				}
-				pathParams = append(pathParams, p)
-			}
-
-			// Method-scoped query params + requestBody
-			queryParams, reqBody := buildParamsAndBody(m, routeArgs, epArgsForMethod)
-			op.Parameters = append(pathParams, queryParams...)
-			if reqBody != nil {
-				op.RequestBody = reqBody
-			}
-
-			// Attach under verb
-			switch m {
-			case "GET":
-				paths[oasPath]["get"] = op
-			case "POST":
-				paths[oasPath]["post"] = op
-			case "PUT":
-				paths[oasPath]["put"] = op
-			case "PATCH":
-				paths[oasPath]["patch"] = op
-			case "DELETE":
-				paths[oasPath]["delete"] = op
-			case "HEAD":
-				paths[oasPath]["head"] = op
-			case "OPTIONS":
-				paths[oasPath]["options"] = op
-			}
+			s.Nullable = nullable
 		}
 	}
-
-	api := openAPI{
-		OpenAPI: "3.0.3",
-		Info: openAPIInfo{
-			Title:   title,
-			Version: version,
-		},
-		Servers: []openAPIServer{{URL: strings.TrimRight(serverBase, "/")}},
-		Paths:   paths,
-	}
-	return api
-}
-
-// Convert WP route key like "/wp/v2/posts/(?P<id>\\d+)" to "/wp/v2/posts/{id}"
-// Return the OAS path and a map of param -> regex pattern.
-func wpRouteToOASPath(route string) (string, map[string]string) {
-	paramPatterns := map[string]string{}
-	out := reGroup.ReplaceAllStringFunc(route, func(m string) string {
-		sub := reGroup.FindStringSubmatch(m)
-		if len(sub) == 3 {
-			name := sub[1]
-			pat := sub[2]
-			paramPatterns[name] = pat
-			return "{" + name + "}"
-		}
-		return m
-	})
-	// WP routes are already rooted. Ensure no trailing slash normalization change.
-	return out, paramPatterns
-}
-
-func wpArgToSchema(a wpArgSchema) map[string]any {
-    s := map[string]any{}
-
-    // Parse type: it may be a string or an array of strings.
-    var typeStr string
-    var typeList []string
-    if len(a.Type) == 0 {
-        typeStr = "string"
-    } else if a.Type[0] == '"' {
-        // string
-        _ = json.Unmarshal(a.Type, &typeStr)
-    } else if a.Type[0] == '[' {
-        _ = json.Unmarshal(a.Type, &typeList)
-    }
-
-    applySimpleType := func(t string) {
-        switch strings.ToLower(t) {
-        case "array":
-            s["type"] = "array"
-            // Try to coerce items if WP specified them; else default to string
-            if a.Items != nil {
-                // best-effort: if items is an object with "type", pass it through
-                b, _ := json.Marshal(a.Items)
-                var obj map[string]any
-                if json.Unmarshal(b, &obj) == nil {
-                    if _, ok := obj["type"]; ok {
-                        s["items"] = obj
-                    } else {
-                        s["items"] = map[string]any{"type": "string"}
-                    }
-                } else {
-                    s["items"] = map[string]any{"type": "string"}
-                }
-            } else {
-                s["items"] = map[string]any{"type": "string"}
-            }
-        case "object":
-            s["type"] = "object"
-        case "integer", "number", "string", "boolean":
-            s["type"] = strings.ToLower(t)
-        default:
-            s["type"] = "string"
-        }
-    }
-
-    if len(typeList) > 0 {
-        // OAS 3 does not allow "type" as an array; use oneOf.
-        oneOf := make([]map[string]any, 0, len(typeList))
-        for _, t := range typeList {
-            tmp := map[string]any{}
-            // Build per-option schema
-            switch strings.ToLower(t) {
-            case "array":
-                tmp["type"] = "array"
-                tmp["items"] = map[string]any{"type": "string"}
-            case "object":
-                tmp["type"] = "object"
-            case "integer", "number", "string", "boolean":
-                tmp["type"] = strings.ToLower(t)
-            default:
-                tmp["type"] = "string"
-            }
-            oneOf = append(oneOf, tmp)
-        }
-        s["oneOf"] = oneOf
-    } else {
-        applySimpleType(typeStr)
-    }
-
-    if a.Format != "" {
-        s["format"] = a.Format
-    }
-    if len(a.Enum) > 0 {
-        s["enum"] = a.Enum
-    }
-    if a.Default != nil {
-        s["default"] = a.Default
-    }
-    return s
-}
-
-// ------ Helpers ------
-
-type set[T comparable] map[T]struct{}
-
-func (s set[T]) add(v T) { s[v] = struct{}{} }
-func (s set[T]) sorted() []T {
-	out := make([]T, 0, len(s))
-	for v := range s {
-		out = append(out, v)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		return fmt.Sprint(out[i]) < fmt.Sprint(out[j])
-	})
-	return out
-}
-
-func fail(fmtStr string, a ...any) {
-	fmt.Fprintf(os.Stderr, "error: "+fmtStr+"\n", a...)
-	os.Exit(1)
-}
-
-func ensureTrailingSlash(s string) string {
-	if strings.HasSuffix(s, "/") {
-		return s
-	}
-	return s + "/"
-}
-
-func firstNonEmpty(s ...string) string {
-	for _, v := range s {
-		if strings.TrimSpace(v) != "" {
-			return v
+	if desc, _ := arg["description"].(string); desc != "" { s.Description = desc }
+	if fmtStr, _ := arg["format"].(string); fmtStr != "" { s.Format = fmtStr }
+	if ev, ok := arg["enum"].([]any); ok && len(ev) > 0 { s.Enum = ev }
+	// items
+	if it, ok := arg["items"].(map[string]any); ok { child := buildSchema(it); s.Items = &child }
+	// properties
+	if pv, ok := arg["properties"].(map[string]any); ok && len(pv) > 0 {
+		s.Type = "object"
+		s.Properties = map[string]OASchema{}
+		for k, v := range pv { if vm, ok := v.(map[string]any); ok { s.Properties[k] = buildSchema(vm) } }
+		// required list
+		if rv, ok := arg["required"].([]any); ok {
+			for _, r := range rv { if rs, ok := r.(string); ok { s.Required = append(s.Required, rs) } }
 		}
 	}
-	return ""
+	if ap, ok := arg["additionalProperties"]; ok { s.AdditionalProperties = ap }
+	return s
 }
 
-func mustHost(base string) string {
-	u, _ := url.Parse(base)
-	return u.Hostname()
+func normalizeType(t string) string {
+	switch t {
+	case "integer", "number", "boolean", "string", "array", "object":
+		return t
+	case "file":
+		return "string" // OAS3 uses string+binary in multipart; we keep simple here
+	default:
+		return "string"
+	}
+}
+
+func opID(method, path string) string {
+	clean := strings.Trim(path, "/")
+	clean = strings.ReplaceAll(clean, "/", "_")
+	clean = strings.ReplaceAll(clean, "{", ""); clean = strings.ReplaceAll(clean, "}", "")
+	clean = strings.ReplaceAll(clean, "-", "_")
+	if clean == "" { clean = "root" }
+	return strings.ToLower(method + "_" + clean)
+}
+
+func buildOperation(method, path string, tags []string, pathParams []string, args map[string]any, summary string) *OAOperation {
+	m := strings.ToUpper(method)
+	op := &OAOperation{ OperationID: opID(m, path), Summary: summary, Tags: tags, Responses: map[string]OAResponse{"200": {Description: "OK"}} }
+	// Path params
+	for _, nm := range pathParams {
+		op.Parameters = append(op.Parameters, OAParameter{ Name: nm, In: "path", Required: true, Schema: OASchema{ Type: "string" } })
+	}
+	if m == "POST" || m == "PUT" || m == "PATCH" {
+		if len(args) > 0 {
+			props := map[string]OASchema{}; req := []string{}
+			for name, raw := range args {
+				am, _ := raw.(map[string]any); if am == nil { continue }
+				// avoid echoing path params in body
+				isPath := false; for _, pn := range pathParams { if name == pn { isPath = true; break } }
+				if isPath { continue }
+				props[name] = buildSchema(am)
+				if rb, ok := am["required"].(bool); ok && rb { req = append(req, name) }
+			}
+			body := OASchema{ Type: "object", Properties: props }
+			if len(req) > 0 { body.Required = req }
+			op.RequestBody = &OARequestBody{ Required: len(req) > 0, Content: map[string]OAMedia{"application/json": { Schema: body }, "application/x-www-form-urlencoded": { Schema: body }}}
+		}
+	} else {
+		// GET/DELETE/HEAD/OPTIONS -> query
+		for name, raw := range args {
+			am, _ := raw.(map[string]any); if am == nil { continue }
+			// skip path params
+			skip := false; for _, pn := range pathParams { if name == pn { skip = true; break } }
+			if skip { continue }
+			req := false; if rb, ok := am["required"].(bool); ok { req = rb }
+			desc, _ := am["description"].(string)
+			op.Parameters = append(op.Parameters, OAParameter{ Name: name, In: "query", Required: req, Description: desc, Schema: buildSchema(am) })
+		}
+	}
+	return op
+}
+
+// ---------------- Conversion ----------------
+
+type stats struct{ routes, endpoints, ops int }
+
+func convert(idx *WPIndex, source string) (*OA3Spec, *stats, error) {
+	if idx == nil || idx.Routes == nil { return nil, nil, errors.New("no routes found") }
+	base := idx.URL; if base == "" { base = idx.Home }
+	if base == "" && isHTTP(source) { base = originFromURL(source) }
+	if base == "" { base = "https://example.com" }
+
+	title := idx.Name; if title == "" { title = "WordPress REST" }
+	spec := &OA3Spec{ OpenAPI: "3.0.3", Info: OAInfo{ Title: title, Description: idx.Description, Version: "1.0.0" }, Servers: []OAServer{{URL: base}}, Paths: map[string]OAPathItem{} }
+	st := &stats{}
+
+	// stable key order
+	keys := make([]string, 0, len(idx.Routes))
+	for k := range idx.Routes { keys = append(keys, k) }
+	sort.Strings(keys)
+	st.routes = len(keys)
+
+	for _, raw := range keys {
+		r := idx.Routes[raw]
+		path, pathParams := sanitizeRoutePath(raw)
+		pi := spec.Paths[path]
+		for _, ep := range r.Endpoints {
+			st.endpoints++
+			methods := ep.Methods
+			if len(methods) == 0 && len(r.Methods) > 0 { methods = r.Methods }
+			epArgs := parseArgs(ep.ArgsRaw)
+			routeArgs := parseArgs(r.ArgsRaw)
+			for _, m := range methods {
+				args := chooseArgsForMethod(routeArgs, epArgs, m)
+				op := buildOperation(m, path, []string{r.Namespace}, pathParams, args, r.Namespace)
+				switch strings.ToUpper(m) {
+				case "GET": pi.Get = op
+				case "POST": pi.Post = op
+				case "PUT": pi.Put = op
+				case "PATCH": pi.Patch = op
+				case "DELETE": pi.Delete = op
+				case "OPTIONS": pi.Options = op
+				case "HEAD": pi.Head = op
+				}
+				st.ops++
+			}
+		}
+		// Fallback if no endpoints emitted
+		if pi == (OAPathItem{}) && len(r.Methods) > 0 {
+			routeArgs := parseArgs(r.ArgsRaw)
+			for _, m := range r.Methods {
+				op := buildOperation(m, path, []string{r.Namespace}, pathParams, routeArgs, r.Namespace)
+				switch strings.ToUpper(m) {
+				case "GET": pi.Get = op
+				case "POST": pi.Post = op
+				case "PUT": pi.Put = op
+				case "PATCH": pi.Patch = op
+				case "DELETE": pi.Delete = op
+				case "OPTIONS": pi.Options = op
+				case "HEAD": pi.Head = op
+				}
+				st.ops++
+			}
+		}
+		spec.Paths[path] = pi
+	}
+	if len(spec.Paths) == 0 { return nil, st, errors.New("no paths emitted") }
+	return spec, st, nil
+}
+
+func originFromURL(u string) string { sp := strings.SplitN(u, "/", 4); if len(sp) >= 3 { return sp[0] + "//" + sp[2] }; return u }
+
+// ---------------- Main ----------------
+
+func main() {
+	flag.Parse()
+	if *flagURL == "" { fmt.Fprintln(os.Stderr, "Usage: wp2openapi -u <wp-json URL or local file> [-o openapi.json] [--debug]"); os.Exit(2) }
+	data, err := fetch(*flagURL)
+	if err != nil { fmt.Fprintf(os.Stderr, "fetch error: %v\n", err); os.Exit(1) }
+
+	var idx WPIndex
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&idx); err != nil { fmt.Fprintf(os.Stderr, "decode error: %v\n", err); os.Exit(1) }
+
+	spec, st, err := convert(&idx, *flagURL)
+	if err != nil { fmt.Fprintf(os.Stderr, "convert error: %v\n", err) }
+	if *flagDebug {
+		fmt.Fprintf(os.Stderr, "routes=%d endpoints=%d ops=%d paths_out=%d\n", st.routes, st.endpoints, st.ops, len(spec.Paths))
+	}
+	out, err := json.MarshalIndent(spec, "", "  ")
+	if err != nil { fmt.Fprintf(os.Stderr, "marshal error: %v\n", err); os.Exit(1) }
+	if *flagOut == "" { os.Stdout.Write(out); return }
+	if err := os.WriteFile(*flagOut, out, 0644); err != nil { fmt.Fprintf(os.Stderr, "write error: %v\n", err); os.Exit(1) }
+	if *flagDebug { fmt.Fprintf(os.Stderr, "wrote %s (%s bytes)\n", filepath.Base(*flagOut), strconv.Itoa(len(out))) }
 }
