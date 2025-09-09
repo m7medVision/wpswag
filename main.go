@@ -310,9 +310,28 @@ type stats struct{ routes, endpoints, ops int }
 
 func convert(idx *WPIndex, source string) (*OA3Spec, *stats, error) {
 	if idx == nil || idx.Routes == nil { return nil, nil, errors.New("no routes found") }
-	base := idx.URL; if base == "" { base = idx.Home }
-	if base == "" && isHTTP(source) { base = originFromURL(source) }
-	if base == "" { base = "https://example.com" }
+
+	base := idx.URL
+	if base == "" { base = idx.Home }
+	if isHTTP(source) {
+	    // If the source points to a namespace (/wp-json/wp/v2) or root,
+	    // normalize the server URL to origin + /wp-json
+	    o := originFromURL(source)
+	    // Only append /wp-json if not already present
+	    if !strings.Contains(source, "/wp-json") {
+		base = strings.TrimRight(o, "/") + "/wp-json"
+	    } else {
+		// strip to .../wp-json if deeper
+		i := strings.Index(source, "/wp-json")
+		base = strings.TrimRight(o, "/") + "/wp-json"
+		if i >= 0 {
+		    base = strings.TrimRight(o, "/") + "/wp-json"
+		}
+	    }
+	}
+	if base == "" {
+	    base = "https://example.com/wp-json"
+	}
 
 	title := idx.Name; if title == "" { title = "WordPress REST" }
 	spec := &OA3Spec{ OpenAPI: "3.0.3", Info: OAInfo{ Title: title, Description: idx.Description, Version: "1.0.0" }, Servers: []OAServer{{URL: base}}, Paths: map[string]OAPathItem{} }
@@ -374,6 +393,22 @@ func convert(idx *WPIndex, source string) (*OA3Spec, *stats, error) {
 
 func originFromURL(u string) string { sp := strings.SplitN(u, "/", 4); if len(sp) >= 3 { return sp[0] + "//" + sp[2] }; return u }
 
+// cleanJSON removes UTF BOMs and any leading junk before '{' or '['.
+func cleanJSON(b []byte) []byte {
+    // UTF-8 BOM
+    if len(b) >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF {
+        b = b[3:]
+    }
+    // Trim common whitespace
+    b = bytes.TrimLeft(b, "\r\n\t ")
+
+    // In case something injected text before the JSON, jump to first '{' or '['
+    if i := bytes.IndexAny(b, "{["); i > 0 {
+        b = b[i:]
+    }
+    return b
+}
+
 // ---------------- Main ----------------
 
 func main() {
@@ -381,6 +416,7 @@ func main() {
 	if *flagURL == "" { fmt.Fprintln(os.Stderr, "Usage: wp2openapi -u <wp-json URL or local file> [-o openapi.json] [--debug]"); os.Exit(2) }
 	data, err := fetch(*flagURL)
 	if err != nil { fmt.Fprintf(os.Stderr, "fetch error: %v\n", err); os.Exit(1) }
+	data = cleanJSON(data)
 
 	var idx WPIndex
 	dec := json.NewDecoder(bytes.NewReader(data))
