@@ -123,6 +123,63 @@ type openAPIRes struct {
 
 // ------ Main ------
 
+// Split endpoint args for a given HTTP method into query params vs JSON body schema.
+// Route-level args should always be query parameters; pass them in via routeArgs.
+// Returns (queryParams, requestBodyPtr).
+func buildParamsAndBody(method string, routeArgs map[string]wpArgSchema, epArgs map[string]wpArgSchema) ([]openAPIParameter, *openAPIRequestBody) {
+	var params []openAPIParameter
+
+	// 1) Route-level args => always query params
+	for name, a := range routeArgs {
+		params = append(params, openAPIParameter{
+			Name:        name,
+			In:          "query",
+			Required:    a.Required,
+			Description: a.Description,
+			Schema:      wpArgToSchema(a),
+		})
+	}
+
+	isBodyMethod := method == "POST" || method == "PUT" || method == "PATCH"
+
+	if !isBodyMethod {
+		// 2a) Non-body verbs: endpoint args also treated as query params
+		for name, a := range epArgs {
+			params = append(params, openAPIParameter{
+				Name:        name,
+				In:          "query",
+				Required:    a.Required,
+				Description: a.Description,
+				Schema:      wpArgToSchema(a),
+			})
+		}
+		return params, nil
+	}
+
+	// 2b) Body verbs: endpoint args -> JSON request body schema
+	props := map[string]any{}
+	required := []string{}
+	for name, a := range epArgs {
+		props[name] = wpArgToSchema(a)
+		if a.Required {
+			required = append(required, name)
+		}
+	}
+
+	bodySchema := map[string]any{"type": "object", "properties": props}
+	if len(required) > 0 {
+		bodySchema["required"] = required
+	}
+
+	body := &openAPIRequestBody{
+		Required: len(required) > 0,
+		Content: map[string]openAPIMediaType{
+			"application/json": {Schema: bodySchema},
+		},
+	}
+	return params, body
+}
+
 func main() {
 	var (
 		inURL   string
@@ -273,48 +330,47 @@ func buildOpenAPI(idx wpIndex, title, version, serverBase string) openAPI {
 	for _, route := range routeKeys {
 		meta := idx.Routes[route]
 
-		// Convert WP regex path → OAS templated path
+		// Convert path & collect path param patterns
 		oasPath, paramPatterns := wpRouteToOASPath(route)
 
-		// Gather methods: prefer union of endpoints[].methods
+		// Gather methods (union of endpoints[].methods, fallback to route-level methods, default GET)
 		methods := set[string]{}
 		for _, ep := range meta.Endpoints {
-			for _, m := range ep.Methods {
-				methods.add(strings.ToUpper(m))
-			}
+			for _, m := range ep.Methods { methods.add(strings.ToUpper(m)) }
 		}
 		if len(methods) == 0 {
-			for _, m := range meta.Methods {
-				methods.add(strings.ToUpper(m))
-			}
+			for _, m := range meta.Methods { methods.add(strings.ToUpper(m)) }
 		}
-		if len(methods) == 0 {
-			// Default to GET if nothing advertised
-			methods.add("GET")
-		}
+		if len(methods) == 0 { methods.add("GET") }
 
-		// Gather args: union of route-level args and endpoint args
-		args := map[string]wpArgSchema{}
-		for k, v := range meta.Args {
-			args[k] = v
-		}
-		for _, ep := range meta.Endpoints {
-			for k, v := range decodeArgs(ep.Args) {
-				args[k] = v
-			}
-		}
+		// Route-level args: usually collection filters/pagination
+		routeArgs := map[string]wpArgSchema{}
+		for k, v := range meta.Args { routeArgs[k] = v }
 
-		// Build a parameter list per operation. Path params are always required.
+		// Ensure path exists
+		if _, ok := paths[oasPath]; !ok { paths[oasPath] = openAPIPath{} }
+
+		// Compute path params from template
 		pathParamSet := map[string]struct{}{}
-		for _, name := range reParam.FindAllStringSubmatch(oasPath, -1) {
-			pathParamSet[name[1]] = struct{}{}
-		}
-
-		if _, ok := paths[oasPath]; !ok {
-			paths[oasPath] = openAPIPath{}
+		for _, m := range reParam.FindAllStringSubmatch(oasPath, -1) {
+			pathParamSet[m[1]] = struct{}{}
 		}
 
 		for _, m := range methods.sorted() {
+			// Collect endpoint args for *this* method only
+			epArgsForMethod := map[string]wpArgSchema{}
+			for _, ep := range meta.Endpoints {
+				verbMatches := false
+				for _, em := range ep.Methods {
+					if strings.EqualFold(em, m) { verbMatches = true; break }
+				}
+				if !verbMatches { continue }
+				for k, v := range decodeArgs(ep.Args) {
+					epArgsForMethod[k] = v
+				}
+			}
+
+			// Build operation shell
 			op := openAPIOperation{
 				Summary:     fmt.Sprintf("%s %s", m, oasPath),
 				Description: fmt.Sprintf("Auto-generated from WordPress REST index for %q.", route),
@@ -325,53 +381,32 @@ func buildOpenAPI(idx wpIndex, title, version, serverBase string) openAPI {
 				},
 			}
 
-			// Parameters
-			params := make([]openAPIParameter, 0, len(args))
-			// First, path parameters (from template)
+			// Path parameters are always required
+			var pathParams []openAPIParameter
 			for pname := range pathParamSet {
-				param := openAPIParameter{
+				p := openAPIParameter{
 					Name:     pname,
 					In:       "path",
 					Required: true,
 					Schema:   map[string]any{"type": "string"},
 				}
 				if pat, ok := paramPatterns[pname]; ok && pat != "" {
-					param.Schema["pattern"] = pat
+					p.Schema["pattern"] = pat
 				}
-				if a, ok := args[pname]; ok && a.Description != "" {
-					param.Description = a.Description
+				if a, ok := routeArgs[pname]; ok && a.Description != "" {
+					p.Description = a.Description
 				}
-				params = append(params, param)
-			}
-			// Then, query parameters (everything else we know about)
-			for name, a := range args {
-				if _, isPath := pathParamSet[name]; isPath {
-					continue
-				}
-				param := openAPIParameter{
-					Name:        name,
-					In:          "query",
-					Required:    a.Required,
-					Description: a.Description,
-					Schema:      wpArgToSchema(a),
-				}
-				params = append(params, param)
-			}
-			if len(params) > 0 {
-				op.Parameters = params
+				pathParams = append(pathParams, p)
 			}
 
-			// Generic requestBody for non-GET/HEAD
-			if m != "GET" && m != "HEAD" {
-				op.RequestBody = &openAPIRequestBody{
-					Required: false,
-					Content: map[string]openAPIMediaType{
-						"application/json": {Schema: map[string]any{"type": "object"}},
-					},
-				}
+			// Method-scoped query params + requestBody
+			queryParams, reqBody := buildParamsAndBody(m, routeArgs, epArgsForMethod)
+			op.Parameters = append(pathParams, queryParams...)
+			if reqBody != nil {
+				op.RequestBody = reqBody
 			}
 
-			// Insert operation under method key
+			// Attach under verb
 			switch m {
 			case "GET":
 				paths[oasPath]["get"] = op
@@ -387,8 +422,6 @@ func buildOpenAPI(idx wpIndex, title, version, serverBase string) openAPI {
 				paths[oasPath]["head"] = op
 			case "OPTIONS":
 				paths[oasPath]["options"] = op
-			default:
-				// ignore uncommon verbs for now
 			}
 		}
 	}
