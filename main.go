@@ -28,10 +28,10 @@ type wpIndex struct {
 }
 
 type wpRouteMeta struct {
-	Namespace string                 `json:"namespace"`
-	Methods   []string               `json:"methods"`
-	Endpoints []wpEndpoint           `json:"endpoints"`
-	Args      map[string]wpArgSchema `json:"args"`
+	Namespace string					`json:"namespace"`
+	Methods   []string					`json:"methods"`
+	Endpoints []wpEndpoint				`json:"endpoints"`
+	Args      json.RawMessage			`json:"args"` // can be {}, [] or null
 	// Some installs include "schema" in the root index, but we ignore for MVP.
 }
 
@@ -43,7 +43,7 @@ type wpEndpoint struct {
 type wpArgSchema struct {
 	Required    bool            `json:"required"`
 	Default     any             `json:"default"`
-	Type        string          `json:"type"`
+	Type        json.RawMessage `json:"type"`
 	Enum        []any           `json:"enum"`
 	Items       any             `json:"items"`
 	Format      string          `json:"format"`
@@ -344,8 +344,9 @@ func buildOpenAPI(idx wpIndex, title, version, serverBase string) openAPI {
 		if len(methods) == 0 { methods.add("GET") }
 
 		// Route-level args: usually collection filters/pagination
-		routeArgs := map[string]wpArgSchema{}
-		for k, v := range meta.Args { routeArgs[k] = v }
+		routeArgs := decodeArgs(meta.Args) // instead of looping meta.Args directly
+		//routeArgs := map[string]wpArgSchema{}
+		//for k, v := range meta.Args { routeArgs[k] = v }
 
 		// Ensure path exists
 		if _, ok := paths[oasPath]; !ok { paths[oasPath] = openAPIPath{} }
@@ -457,33 +458,84 @@ func wpRouteToOASPath(route string) (string, map[string]string) {
 }
 
 func wpArgToSchema(a wpArgSchema) map[string]any {
-	s := map[string]any{}
-	typ := strings.ToLower(a.Type)
-	if typ == "" {
-		// WP often omits type; default to string to keep OAS validators happy.
-		typ = "string"
-	}
-	switch typ {
-	case "array":
-		// MVP: leave items as string if unknown
-		s["type"] = "array"
-		s["items"] = map[string]any{"type": "string"}
-	case "object":
-		s["type"] = "object"
-	default:
-		s["type"] = typ
-	}
-	if a.Format != "" {
-		s["format"] = a.Format
-	}
-	if len(a.Enum) > 0 {
-		// JSON-ify enums as-is
-		s["enum"] = a.Enum
-	}
-	if a.Default != nil {
-		s["default"] = a.Default
-	}
-	return s
+    s := map[string]any{}
+
+    // Parse type: it may be a string or an array of strings.
+    var typeStr string
+    var typeList []string
+    if len(a.Type) == 0 {
+        typeStr = "string"
+    } else if a.Type[0] == '"' {
+        // string
+        _ = json.Unmarshal(a.Type, &typeStr)
+    } else if a.Type[0] == '[' {
+        _ = json.Unmarshal(a.Type, &typeList)
+    }
+
+    applySimpleType := func(t string) {
+        switch strings.ToLower(t) {
+        case "array":
+            s["type"] = "array"
+            // Try to coerce items if WP specified them; else default to string
+            if a.Items != nil {
+                // best-effort: if items is an object with "type", pass it through
+                b, _ := json.Marshal(a.Items)
+                var obj map[string]any
+                if json.Unmarshal(b, &obj) == nil {
+                    if _, ok := obj["type"]; ok {
+                        s["items"] = obj
+                    } else {
+                        s["items"] = map[string]any{"type": "string"}
+                    }
+                } else {
+                    s["items"] = map[string]any{"type": "string"}
+                }
+            } else {
+                s["items"] = map[string]any{"type": "string"}
+            }
+        case "object":
+            s["type"] = "object"
+        case "integer", "number", "string", "boolean":
+            s["type"] = strings.ToLower(t)
+        default:
+            s["type"] = "string"
+        }
+    }
+
+    if len(typeList) > 0 {
+        // OAS 3 does not allow "type" as an array; use oneOf.
+        oneOf := make([]map[string]any, 0, len(typeList))
+        for _, t := range typeList {
+            tmp := map[string]any{}
+            // Build per-option schema
+            switch strings.ToLower(t) {
+            case "array":
+                tmp["type"] = "array"
+                tmp["items"] = map[string]any{"type": "string"}
+            case "object":
+                tmp["type"] = "object"
+            case "integer", "number", "string", "boolean":
+                tmp["type"] = strings.ToLower(t)
+            default:
+                tmp["type"] = "string"
+            }
+            oneOf = append(oneOf, tmp)
+        }
+        s["oneOf"] = oneOf
+    } else {
+        applySimpleType(typeStr)
+    }
+
+    if a.Format != "" {
+        s["format"] = a.Format
+    }
+    if len(a.Enum) > 0 {
+        s["enum"] = a.Enum
+    }
+    if a.Default != nil {
+        s["default"] = a.Default
+    }
+    return s
 }
 
 // ------ Helpers ------
