@@ -2,6 +2,13 @@
 
 A utility to read a WordPress REST definition and generate an OpenAPI/Swagger v3 spec.
 
+It turns this:
+<img width="50%" alt="screenshot of a browser window showing raw JSON blobs" src="https://github.com/user-attachments/assets/91576730-fa72-4a1d-98d7-8d5a9e67f9e7" />
+
+Into this:
+<img width="50%" alt="Screenshot of a browser window showing swagger UI" src="https://github.com/user-attachments/assets/db26accc-5738-4ac2-8e8e-46d009fbeb0e" />
+
+
 ## Usage
 
 ```
