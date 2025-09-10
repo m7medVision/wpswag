@@ -1,8 +1,5 @@
-// wp2openapi: Generate an OpenAPI 3.0 spec from a WordPress REST index/namespace
-// - Handles nested named regex groups in routes (balanced parsing)
-// - Tolerant to args/properties/items being {} or []
-// - Keeps endpoint args per method; GET-ish -> query params; write methods -> requestBody
-// - Accepts -u (URL or local JSON path), -o (output), -debug for diagnostics
+// wpswag: Generate an OpenAPI 3.0 spec from a WordPress REST index/namespace
+// vibe coded by @singe
 
 package main
 
@@ -413,7 +410,7 @@ func cleanJSON(b []byte) []byte {
 
 func main() {
 	flag.Parse()
-	if *flagURL == "" { fmt.Fprintln(os.Stderr, "Usage: wp2openapi -u <wp-json URL or local file> [-o openapi.json] [--debug]"); os.Exit(2) }
+	if *flagURL == "" { fmt.Fprintln(os.Stderr, "Usage: wpswag -u <wp-json URL or local file> [-o openapi.json] [--debug]"); os.Exit(2) }
 	data, err := fetch(*flagURL)
 	if err != nil { fmt.Fprintf(os.Stderr, "fetch error: %v\n", err); os.Exit(1) }
 	data = cleanJSON(data)
