@@ -10,9 +10,9 @@ import (
 	"sync"
 	"unicode"
 
-	"sensepost.com/wpswag/internal/oas"
-	"sensepost.com/wpswag/internal/util"
-	"sensepost.com/wpswag/internal/wp"
+	"github.com/m7medVision/wpswag/internal/oas"
+	"github.com/m7medVision/wpswag/internal/util"
+	"github.com/m7medVision/wpswag/internal/wp"
 )
 
 type fetchFunc func(method, source string) ([]byte, error)

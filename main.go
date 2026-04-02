@@ -1,6 +1,6 @@
 package main
 
-import "sensepost.com/wpswag/cmd"
+import "github.com/m7medVision/wpswag/cmd"
 
 func main() {
 	cmd.Execute()

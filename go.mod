@@ -1,4 +1,4 @@
-module sensepost.com/wpswag
+module github.com/m7medVision/wpswag
 
 go 1.25.1
 

@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"testing"
 
-	"sensepost.com/wpswag/internal/oas"
-	"sensepost.com/wpswag/internal/wp"
+	"github.com/m7medVision/wpswag/internal/oas"
+	"github.com/m7medVision/wpswag/internal/wp"
 )
 
 func TestConvertUsesOptionsSchemaForTypedResponsesAndTags(t *testing.T) {

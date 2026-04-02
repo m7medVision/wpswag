@@ -10,9 +10,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"sensepost.com/wpswag/internal/convert"
-	"sensepost.com/wpswag/internal/util"
-	"sensepost.com/wpswag/internal/wp"
+	"github.com/m7medVision/wpswag/internal/convert"
+	"github.com/m7medVision/wpswag/internal/util"
+	"github.com/m7medVision/wpswag/internal/wp"
 )
 
 var (

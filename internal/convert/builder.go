@@ -3,7 +3,7 @@ package convert
 import (
 	"strings"
 
-	"sensepost.com/wpswag/internal/oas"
+	"github.com/m7medVision/wpswag/internal/oas"
 )
 
 // Builder incrementally builds an OpenAPI 3.0.3 spec from WordPress routes.
