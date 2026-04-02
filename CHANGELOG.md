@@ -5,6 +5,13 @@
 
 * change module path from sensepost.com/wpswag to github.com/m7medVision/wpswag ([afa0a11](https://github.com/m7medVision/wpswag/commit/afa0a112a78d04e78ee583646c82798cc5362ea7))
 
+## [1.0.1](https://github.com/m7medVision/wpswag/compare/v1.0.0...v1.0.1) (2026-04-02)
+
+
+### Bug Fixes
+
+* change module path from sensepost.com/wpswag to github.com/m7medVision/wpswag ([afa0a11](https://github.com/m7medVision/wpswag/commit/afa0a112a78d04e78ee583646c82798cc5362ea7))
+
 # 1.0.0 (2026-04-02)
 
 
