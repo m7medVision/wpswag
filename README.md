@@ -2,6 +2,12 @@
 
 `wpswag` converts a WordPress REST API into an OpenAPI 3.0.3 JSON file.
 
+## Install
+
+```bash
+go install github.com/m7medVision/wpswag@latest
+```
+
 ## Build
 
 ```bash
