@@ -79,7 +79,6 @@ func TestConvertUsesOptionsSchemaForTypedResponsesAndTags(t *testing.T) {
 	if postsGet == nil {
 		t.Fatal("expected GET /wp/v2/posts operation")
 	}
-	assertTags(t, postsGet.Tags, []string{"posts"})
 	postsBody := postsGet.Responses["200"].Content["application/json"].Schema
 	if got, _ := postsBody.Type.(string); got != "array" {
 		t.Fatalf("expected posts collection response type array, got %#v", postsBody.Type)
@@ -108,7 +107,6 @@ func TestConvertUsesOptionsSchemaForTypedResponsesAndTags(t *testing.T) {
 	if tagsGet == nil {
 		t.Fatal("expected GET /wp/v2/tags operation")
 	}
-	assertTags(t, tagsGet.Tags, []string{"tags"})
 	if got := tagsGet.Responses["200"].Content["application/json"].Schema.Items.Ref; got != "#/components/schemas/Tag" {
 		t.Fatalf("expected GET /wp/v2/tags to return Tag array, got %q", got)
 	}
@@ -167,16 +165,4 @@ func TestBuildSchemaUsesExplicitOneOfAndNestedAdditionalProperties(t *testing.T)
 
 func rawArgs(v string) json.RawMessage {
 	return json.RawMessage(v)
-}
-
-func assertTags(t *testing.T, got, want []string) {
-	t.Helper()
-	if len(got) != len(want) {
-		t.Fatalf("unexpected tags length: got %#v want %#v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("unexpected tags: got %#v want %#v", got, want)
-		}
-	}
 }

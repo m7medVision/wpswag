@@ -66,7 +66,6 @@ func (c *Converter) Convert() (*oas.Spec, *Stats, error) {
 	for _, meta := range metas {
 		builder.IncrementRoutes()
 		pi := builder.GetPath(meta.path)
-		tag := primaryTag(meta.path, meta.route.Namespace)
 		summary := strings.TrimPrefix(meta.path, "/")
 		responseSchema, hasResponseSchema := resolveResponseSchema(meta.path, discovered)
 
@@ -80,7 +79,7 @@ func (c *Converter) Convert() (*oas.Spec, *Stats, error) {
 			routeArgs := util.ParseArgs(meta.route.ArgsRaw)
 			for _, method := range methods {
 				args := chooseArgsForMethod(routeArgs, epArgs, method)
-				op := buildOperation(method, meta.path, []string{tag}, meta.pathParams, args, summary, responseSchema, hasResponseSchema, meta.isCollection)
+				op := buildOperation(method, meta.path, nil, meta.pathParams, args, summary, responseSchema, hasResponseSchema, meta.isCollection)
 				SetMethodOperation(&pi, method, op)
 				builder.IncrementOps()
 			}
@@ -89,7 +88,7 @@ func (c *Converter) Convert() (*oas.Spec, *Stats, error) {
 		if IsPathItemEmpty(pi) && len(meta.route.Methods) > 0 {
 			routeArgs := util.ParseArgs(meta.route.ArgsRaw)
 			for _, method := range meta.route.Methods {
-				op := buildOperation(method, meta.path, []string{tag}, meta.pathParams, routeArgs, summary, responseSchema, hasResponseSchema, meta.isCollection)
+				op := buildOperation(method, meta.path, nil, meta.pathParams, routeArgs, summary, responseSchema, hasResponseSchema, meta.isCollection)
 				SetMethodOperation(&pi, method, op)
 				builder.IncrementOps()
 			}
@@ -494,7 +493,9 @@ func shouldDiscoverSchema(meta routeMeta) bool {
 	if meta.route == nil || meta.route.Namespace != "wp/v2" || len(meta.pathParams) > 0 {
 		return false
 	}
-	return primaryTag(meta.path, meta.route.Namespace) != meta.route.Namespace
+	parts := splitPath(meta.path)
+	nsParts := splitPath(meta.route.Namespace)
+	return len(parts) > len(nsParts)
 }
 
 func resolveResponseSchema(path string, discovered map[string]string) (oas.Schema, bool) {
@@ -560,30 +561,6 @@ func directCollectionPath(path string) string {
 		return ""
 	}
 	return "/" + strings.Join(parts[:len(parts)-1], "/")
-}
-
-func primaryTag(path, namespace string) string {
-	parts := splitPath(path)
-	nsParts := splitPath(namespace)
-	if len(parts) >= len(nsParts) {
-		matchesNamespace := true
-		for i := range nsParts {
-			if parts[i] != nsParts[i] {
-				matchesNamespace = false
-				break
-			}
-		}
-		if matchesNamespace && len(parts) > len(nsParts) {
-			return parts[len(nsParts)]
-		}
-	}
-	if namespace != "" {
-		return namespace
-	}
-	if len(parts) > 0 {
-		return parts[0]
-	}
-	return "default"
 }
 
 func splitPath(v string) []string {
